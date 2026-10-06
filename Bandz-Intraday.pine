@@ -1,0 +1,1516 @@
+//@version=6
+// Bandz Intraday - hourly/PM macros, automatic and session FVGs, dividers, timestamps, and day labels
+indicator(title="Bandz Intraday Timing + FVG", shorttitle="Bandz Intraday", overlay=true, format=format.price, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500, dynamic_requests=true)
+// ============================================================================
+// QUICK SETTINGS
+// ============================================================================
+bool showHigherTimeframeFvgs = input.bool(
+     false,
+     "Show HTF FVGs on LTF charts",
+     group = "Quick Settings",
+     tooltip = "Also shows the higher automatic FVG tiers on lower-timeframe charts. Example: a 1-minute chart adds 5-minute, 30-minute, 4-hour, and Daily FVGs. Detection, minimum-size rules, and extension times are unchanged."
+)
+bool extendSessionFvgsThroughWeek = input.bool(
+     false,
+     "Extend AM/PM FVGs through the week",
+     group = "Quick Settings",
+     tooltip = "Keeps each first-presented AM and PM FVG extending as new bars print during the same Monday-Sunday week."
+)
+// ============================================================================
+// HOURLY AND LAST-HOUR MACROS
+// Opening Range Bar intentionally lives in Bandz Sessions.
+// ============================================================================
+bool isMacroTF = timeframe.isminutes and timeframe.multiplier == 1
+// ============================================================================
+// ==============================  MACROS  ====================================
+// ============================================================================
+// Every line created by the macro, divider, or calendar modules is registered
+// here. The shared FIFO stays below TradingView's 500-line ceiling and reserves
+// headroom for the one active macro bracket and transient line creation.
+const int BANDZ_SHARED_LINE_BUDGET = 460
+const int BANDZ_LINE_OWNER_MACRO = 1
+const int BANDZ_LINE_OWNER_DIVIDER = 2
+const int BANDZ_LINE_OWNER_CALENDAR = 3
+type BandzLineRecord
+    int owner
+    int channel
+    array<line> drawings
+    label linkedLabel
+var array<BandzLineRecord> bandzLineRecords = array.new<BandzLineRecord>()
+f_bandzRecordLineCount(BandzLineRecord record) =>
+    int count = 0
+    if record.drawings.size() > 0
+        for drawingIndex = 0 to record.drawings.size() - 1
+            if not na(record.drawings.get(drawingIndex))
+                count += 1
+    count
+f_bandzTrackedLineCount() =>
+    int count = 0
+    if bandzLineRecords.size() > 0
+        for recordIndex = 0 to bandzLineRecords.size() - 1
+            count += f_bandzRecordLineCount(bandzLineRecords.get(recordIndex))
+    count
+f_bandzMatchingRecordCount(int owner, int channel) =>
+    int count = 0
+    if bandzLineRecords.size() > 0
+        for recordIndex = 0 to bandzLineRecords.size() - 1
+            BandzLineRecord record = bandzLineRecords.get(recordIndex)
+            if record.owner == owner and record.channel == channel
+                count += 1
+    count
+f_bandzOldestMatchingRecord(int owner, int channel) =>
+    int found = na
+    if bandzLineRecords.size() > 0
+        for recordIndex = 0 to bandzLineRecords.size() - 1
+            BandzLineRecord record = bandzLineRecords.get(recordIndex)
+            if record.owner == owner and record.channel == channel
+                found := recordIndex
+                break
+    found
+f_deleteBandzLineRecord(int recordIndex) =>
+    BandzLineRecord record = bandzLineRecords.remove(recordIndex)
+    if record.drawings.size() > 0
+        for drawingIndex = 0 to record.drawings.size() - 1
+            line drawing = record.drawings.get(drawingIndex)
+            if not na(drawing)
+                line.delete(drawing)
+    if not na(record.linkedLabel)
+        label.delete(record.linkedLabel)
+f_prepareBandzLineRecord(int owner, int channel, int maximumRecords, int requestedLines) =>
+    int matchingCount = f_bandzMatchingRecordCount(owner, channel)
+    while matchingCount >= maximumRecords and bandzLineRecords.size() > 0
+        int oldestMatching = f_bandzOldestMatchingRecord(owner, channel)
+        if na(oldestMatching)
+            break
+        f_deleteBandzLineRecord(oldestMatching)
+        matchingCount -= 1
+    while f_bandzTrackedLineCount() + requestedLines > BANDZ_SHARED_LINE_BUDGET and bandzLineRecords.size() > 0
+        f_deleteBandzLineRecord(0)
+f_storeBandzLineRecord(int owner, int channel, array<line> drawings, label linkedLabel) =>
+    bandzLineRecords.push(BandzLineRecord.new(owner, channel, drawings, linkedLabel))
+const string BANDZ_MACRO_TIMEZONE = "America/New_York"
+const int BANDZ_MACRO_WINDOW_COUNT = 25
+const int BANDZ_MACRO_EVENT_HISTORY = 40
+string macroDisplayMode = input.string("Candle Colors", "Macro Display Mode", options=["Macro Bars", "Candle Colors"], group="Macros - Style", tooltip="Macro Bars draws each enabled time window as a bracket. Candle Colors hides brackets and recolors enabled 1-minute candles inside the windows.")
+color macroBracketColor = input.color(color.rgb(120, 123, 134), title="Macro Color", inline="main", group="Macros - Style")
+bool macroShowLabels = input.bool(true, title="Macro Label?", inline="sh", group="Macros - Style")
+bool macroShowGuides = input.bool(true, title="Macro Projections?", inline="sh", group="Macros - Style", tooltip="Draws dotted guides from each window boundary toward its bracket.")
+int macroVerticalOffsetTicks = input.int(50, "Macro Vertical Offset (ticks)", minval=1, group="Macros - Style", tooltip="Moves macro labels and brackets farther above candles.")
+int macroLegLengthTicks = input.int(10, "Bracket Leg Length (ticks)", minval=1, group="Macros - Style", tooltip="Uses a fixed height for every vertical bracket leg.")
+color macroBullishCandleColor = input.color(color.rgb(156, 156, 156), "Bullish Macro Candle", inline="macroCandles", group="Macros - Candle Colors")
+color macroBearishCandleColor = input.color(color.rgb(245, 194, 69), "Bearish Macro Candle", inline="macroCandles", group="Macros - Candle Colors")
+bool macroBarsMode = macroDisplayMode == "Macro Bars"
+bool macroCandlesMode = macroDisplayMode == "Candle Colors"
+f_bandzMinuteWindow(int currentMinute, int startMinute, int endMinute) =>
+    endMinute > startMinute ?
+         currentMinute >= startMinute and currentMinute < endMinute :
+         currentMinute >= startMinute or currentMinute < endMinute
+var array<bool> macroWindowWasActive = array.new_bool(BANDZ_MACRO_WINDOW_COUNT, false)
+var array<int> macroWindowStartTimes = array.new_int(BANDZ_MACRO_WINDOW_COUNT)
+var array<float> macroWindowTops = array.new_float(BANDZ_MACRO_WINDOW_COUNT)
+var array<line> macroActiveLeftLegs = array.new_line(BANDZ_MACRO_WINDOW_COUNT)
+var array<line> macroActiveRails = array.new_line(BANDZ_MACRO_WINDOW_COUNT)
+var array<line> macroActiveLeftGuides = array.new_line(BANDZ_MACRO_WINDOW_COUNT)
+var array<label> macroActiveCaptions = array.new_label(BANDZ_MACRO_WINDOW_COUNT)
+f_finishBandzMacroEvent(line leftLeg, line rail, line rightLeg, line leftGuide, line rightGuide, label caption) =>
+    array<line> eventLines = array.new_line()
+    eventLines.push(leftLeg)
+    eventLines.push(rail)
+    eventLines.push(rightLeg)
+    if not na(leftGuide)
+        eventLines.push(leftGuide)
+    if not na(rightGuide)
+        eventLines.push(rightGuide)
+    f_prepareBandzLineRecord(
+         BANDZ_LINE_OWNER_MACRO, 0, BANDZ_MACRO_EVENT_HISTORY, eventLines.size())
+    f_storeBandzLineRecord(BANDZ_LINE_OWNER_MACRO, 0, eventLines, caption)
+f_updateBandzMacroWindow(int slot, bool activeNow, string captionText, float referenceTop) =>
+    bool wasActive = macroWindowWasActive.get(slot)
+    float verticalPad = syminfo.mintick * macroVerticalOffsetTicks
+    float legHeight = syminfo.mintick * macroLegLengthTicks
+    if activeNow and not wasActive
+        float bracketTop = math.max(referenceTop, high + verticalPad)
+        line leftLeg = line.new(x1=time, y1=bracketTop - legHeight, x2=time, y2=bracketTop,
+             xloc=xloc.bar_time, color=macroBracketColor)
+        line rail = line.new(x1=time, y1=bracketTop, x2=time_close, y2=bracketTop,
+             xloc=xloc.bar_time, color=macroBracketColor)
+        line leftGuide = macroShowGuides ?
+             line.new(x1=time, y1=high, x2=time, y2=bracketTop, xloc=xloc.bar_time,
+                  color=macroBracketColor, style=line.style_dotted) : na
+        label caption = label.new(x=time, y=bracketTop, text=macroShowLabels ? captionText : "",
+             tooltip=captionText, xloc=xloc.bar_time, style=label.style_label_down,
+             color=color.new(color.white, 100), textcolor=macroBracketColor, size=size.small)
+        macroWindowStartTimes.set(slot, time)
+        macroWindowTops.set(slot, bracketTop)
+        macroActiveLeftLegs.set(slot, leftLeg)
+        macroActiveRails.set(slot, rail)
+        macroActiveLeftGuides.set(slot, leftGuide)
+        macroActiveCaptions.set(slot, caption)
+    if activeNow
+        line leftLeg = macroActiveLeftLegs.get(slot)
+        line rail = macroActiveRails.get(slot)
+        line leftGuide = macroActiveLeftGuides.get(slot)
+        label caption = macroActiveCaptions.get(slot)
+        int startTime = macroWindowStartTimes.get(slot)
+        float bracketTop = macroWindowTops.get(slot)
+        float candidateTop = high + verticalPad
+        if candidateTop > bracketTop
+            bracketTop := candidateTop
+            macroWindowTops.set(slot, bracketTop)
+            line.set_y1(leftLeg, bracketTop - legHeight)
+            line.set_y2(leftLeg, bracketTop)
+            line.set_y1(rail, bracketTop)
+            line.set_y2(rail, bracketTop)
+            label.set_y(caption, bracketTop)
+            if not na(leftGuide)
+                line.set_y1(leftGuide, high)
+                line.set_y2(leftGuide, bracketTop)
+        line.set_x2(rail, time_close)
+        label.set_x(caption, int(math.round(math.avg(startTime, time_close))))
+    if not activeNow and wasActive
+        line leftLeg = macroActiveLeftLegs.get(slot)
+        line rail = macroActiveRails.get(slot)
+        line leftGuide = macroActiveLeftGuides.get(slot)
+        label caption = macroActiveCaptions.get(slot)
+        int startTime = macroWindowStartTimes.get(slot)
+        float bracketTop = macroWindowTops.get(slot)
+        float closingTop = math.max(bracketTop, referenceTop)
+        if closingTop > bracketTop
+            bracketTop := closingTop
+            line.set_y1(leftLeg, bracketTop - legHeight)
+            line.set_y2(leftLeg, bracketTop)
+            line.set_y1(rail, bracketTop)
+            line.set_y2(rail, bracketTop)
+            label.set_y(caption, bracketTop)
+        line rightLeg = line.new(x1=time, y1=bracketTop - legHeight, x2=time, y2=bracketTop,
+             xloc=xloc.bar_time, color=macroBracketColor)
+        line rightGuide = macroShowGuides ?
+             line.new(x1=time, y1=high, x2=time, y2=bracketTop, xloc=xloc.bar_time,
+                  color=macroBracketColor, style=line.style_dotted) : na
+        line.set_x2(rail, time)
+        label.set_x(caption, int(math.round(math.avg(startTime, time))))
+        f_finishBandzMacroEvent(leftLeg, rail, rightLeg, leftGuide, rightGuide, caption)
+        macroWindowStartTimes.set(slot, na)
+        macroWindowTops.set(slot, na)
+        macroActiveLeftLegs.set(slot, na)
+        macroActiveRails.set(slot, na)
+        macroActiveLeftGuides.set(slot, na)
+        macroActiveCaptions.set(slot, na)
+    macroWindowWasActive.set(slot, activeNow)
+// Each toggle is a Bandz schedule requirement. The drawing engine below treats
+// the schedule as data, so adding or removing a window does not duplicate logic.
+bool macroShow0050 = input.bool(true, title="00:50 - 01:10", group="Hourly Macros")
+bool macroShow0150 = input.bool(true, title="01:50 - 02:10", group="Hourly Macros")
+bool macroShow0250 = input.bool(true, title="02:50 - 03:10", group="Hourly Macros")
+bool macroShow0350 = input.bool(true, title="03:50 - 04:10", group="Hourly Macros")
+bool macroShow0450 = input.bool(true, title="04:50 - 05:10", group="Hourly Macros")
+bool macroShow0550 = input.bool(true, title="05:50 - 06:10", group="Hourly Macros")
+bool macroShow0650 = input.bool(true, title="06:50 - 07:10", group="Hourly Macros")
+bool macroShow0750 = input.bool(true, title="07:50 - 08:10", group="Hourly Macros")
+bool macroShow0850 = input.bool(true, title="08:50 - 09:10", group="Hourly Macros")
+bool macroShow0950 = input.bool(true, title="09:50 - 10:10", group="Hourly Macros")
+bool macroShow1050 = input.bool(true, title="10:50 - 11:10", group="Hourly Macros")
+bool macroShow1150 = input.bool(true, title="11:50 - 12:10", group="Hourly Macros")
+bool macroShow1250 = input.bool(true, title="12:50 - 13:10", group="Hourly Macros")
+bool macroShow1350 = input.bool(true, title="13:50 - 14:10", group="Hourly Macros")
+bool macroShow1650 = input.bool(false, title="16:50 - 17:10", group="Hourly Macros")
+bool macroShow1750 = input.bool(false, title="17:50 - 18:10", group="Hourly Macros")
+bool macroShow1850 = input.bool(true, title="18:50 - 19:10", group="Hourly Macros")
+bool macroShow1950 = input.bool(true, title="19:50 - 20:10", group="Hourly Macros")
+bool macroShow2050 = input.bool(true, title="20:50 - 21:10", group="Hourly Macros")
+bool macroShow2150 = input.bool(true, title="21:50 - 22:10", group="Hourly Macros")
+bool macroShow2250 = input.bool(true, title="22:50 - 23:10", group="Hourly Macros")
+bool macroShow2350 = input.bool(true, title="23:50 - 00:10", group="Hourly Macros")
+bool macroShow1450 = input.bool(true, title="14:50 - 15:10", group="Last Hour NY PM Macros")
+bool macroShow1515 = input.bool(true, title="15:15 - 15:45", group="Last Hour NY PM Macros")
+bool macroShow1550 = input.bool(true, title="15:50 - 16:10", group="Last Hour NY PM Macros")
+var array<bool> macroWindowEnabled = array.from(
+     macroShow0050, macroShow0150, macroShow0250, macroShow0350, macroShow0450,
+     macroShow0550, macroShow0650, macroShow0750, macroShow0850, macroShow0950,
+     macroShow1050, macroShow1150, macroShow1250, macroShow1350, macroShow1450,
+     macroShow1515, macroShow1550, macroShow1650, macroShow1750, macroShow1850,
+     macroShow1950, macroShow2050, macroShow2150, macroShow2250, macroShow2350)
+var array<int> macroWindowStartMinute = array.from(
+     50, 110, 170, 230, 290, 350, 410, 470, 530, 590,
+     650, 710, 770, 830, 890, 915, 950, 1010, 1070, 1130,
+     1190, 1250, 1310, 1370, 1430)
+var array<int> macroWindowEndMinute = array.from(
+     70, 130, 190, 250, 310, 370, 430, 490, 550, 610,
+     670, 730, 790, 850, 910, 945, 970, 1030, 1090, 1150,
+     1210, 1270, 1330, 1390, 10)
+var array<string> macroWindowCaption = array.from(
+     "00:50 - 01:10", "01:50 - 02:10", "02:50 - 03:10", "03:50 - 04:10", "04:50 - 05:10",
+     "05:50 - 06:10", "06:50 - 07:10", "07:50 - 08:10", "08:50 - 09:10", "09:50 - 10:10",
+     "10:50 - 11:10", "11:50 - 12:10", "12:50 - 13:10", "13:50 - 14:10", "14:50 - 15:10",
+     "15:15 - 15:45", "15:50 - 16:10", "16:50 - 17:10", "17:50 - 18:10", "18:50 - 19:10",
+     "19:50 - 20:10", "20:50 - 21:10", "21:50 - 22:10", "22:50 - 23:10", "23:50 - 00:10")
+int macroClockMinute = hour(time, BANDZ_MACRO_TIMEZONE) * 60 + minute(time, BANDZ_MACRO_TIMEZONE)
+int macroReferenceBars = isMacroTF ? 15 : 1
+float macroReferenceTop = ta.highest(high, macroReferenceBars) + syminfo.mintick * 15
+bool macroCandleActive = false
+if isMacroTF
+    for slot = 0 to BANDZ_MACRO_WINDOW_COUNT - 1
+        bool enabled = macroWindowEnabled.get(slot)
+        bool insideWindow = f_bandzMinuteWindow(
+             macroClockMinute,
+             macroWindowStartMinute.get(slot),
+             macroWindowEndMinute.get(slot))
+        bool enabledAndInside = enabled and insideWindow
+        if macroCandlesMode and enabledAndInside
+            macroCandleActive := true
+        f_updateBandzMacroWindow(
+             slot,
+             macroBarsMode and enabledAndInside,
+             macroWindowCaption.get(slot),
+             macroReferenceTop)
+color macroCandleColor = close >= open ? macroBullishCandleColor : macroBearishCandleColor
+barcolor(isMacroTF and macroCandlesMode and macroCandleActive ? macroCandleColor : na)
+// ============================================================================
+// FAIR VALUE GAPS AND AUTOMATIC FVG-TIMEFRAME DIVIDERS
+// ADR intentionally lives in Bandz Reference Levels.
+// ============================================================================
+//====================================================================
+// HELPERS
+//====================================================================
+f_lineStyle(_choice) =>
+    _choice == "Dotted" ? line.style_dotted :
+     _choice == "Dashed" ? line.style_dashed :
+     line.style_solid
+f_detectionTfLabel(_tf) =>
+    _tf == "1" ? "M1" :
+     _tf == "5" ? "M5" :
+     _tf == "30" ? "M30" :
+     _tf == "240" ? "H4" :
+     _tf == "D" ? "D1" :
+     _tf
+f_weekdayAbbreviation(int _timestamp, string _timezone) =>
+    eventDay = dayofweek(_timestamp, _timezone)
+    eventDay == dayofweek.monday ? "Mon" :
+     eventDay == dayofweek.tuesday ? "Tue" :
+     eventDay == dayofweek.wednesday ? "Wed" :
+     eventDay == dayofweek.thursday ? "Thu" :
+     eventDay == dayofweek.friday ? "Fri" :
+     eventDay == dayofweek.saturday ? "Sat" :
+     "Sun"
+f_weekStartTime(int _timestamp, string _timezone) =>
+    eventDay = dayofweek(_timestamp, _timezone)
+    daysSinceMonday = eventDay == dayofweek.sunday ? 6 : eventDay - dayofweek.monday
+    eventMidnight = timestamp(
+         _timezone,
+         year(_timestamp, _timezone),
+         month(_timestamp, _timezone),
+         dayofmonth(_timestamp, _timezone),
+         0,
+         0
+    )
+    eventMidnight - daysSinceMonday * 24 * 60 * 60 * 1000
+f_extendSessionFvgsThroughWeek(
+     array<box> _boxes,
+     array<label> _labels,
+     int _bufferBars,
+     string _timezone
+) =>
+    currentWeekStart = f_weekStartTime(time, _timezone)
+    chartBarMilliseconds = int(timeframe.in_seconds() * 1000)
+    currentBarCloseTime = na(time_close) ?
+         time + chartBarMilliseconds :
+         time_close
+    bufferedRightTime = currentBarCloseTime + chartBarMilliseconds * _bufferBars
+    if array.size(_boxes) > 0
+        for index = 0 to array.size(_boxes) - 1
+            sessionBox = array.get(_boxes, index)
+            sessionLabel = array.get(_labels, index)
+            if not na(sessionBox) and
+                 f_weekStartTime(box.get_left(sessionBox), _timezone) == currentWeekStart
+                extendedRightTime = math.max(
+                     box.get_right(sessionBox),
+                     bufferedRightTime
+                )
+                box.set_right(sessionBox, extendedRightTime)
+                if not na(sessionLabel)
+                    label.set_x(sessionLabel, extendedRightTime)
+//====================================================================
+// AUTOMATIC FIRST-PRESENTED FVG
+//====================================================================
+// Returns true only when two price zones overlap by at least one tick.
+// Touching at a single boundary is not treated as an overlap.
+f_priceZonesOverlapByTick(float _topA, float _bottomA, float _topB, float _bottomB) =>
+    if na(_topA) or na(_bottomA) or na(_topB) or na(_bottomB)
+        false
+    else
+        overlapTop = math.min(_topA, _topB)
+        overlapBottom = math.max(_bottomA, _bottomB)
+        overlapTop - overlapBottom >= syminfo.mintick
+f_firstPresentedFvg(_parentTf, _minimumTicks) =>
+    var bool  foundFvg       = false
+    var int   savedEventId   = na
+    var int   savedLeftTime  = na
+    var int   savedRightTime = na
+    var float savedTop       = na
+    var float savedBottom    = na
+    var int   savedDirection = 0
+    var float savedUpperViTop    = na
+    var float savedUpperViBottom = na
+    var float savedLowerViTop    = na
+    var float savedLowerViBottom = na
+    // NDOG / NWOG protection for the parent period containing the 6:00 PM ET reopen.
+    // The opening gap is previous traded close -> current 6:00 PM ET open.
+    // Sunday reopen is the NWOG; weekday reopens are NDOGs.
+    var bool  filterOpeningGapThisParent = false
+    var float openingGapTop              = na
+    var float openingGapBottom           = na
+    parentStart = time(_parentTf)
+    newParentPeriod = not na(parentStart) and (
+         na(parentStart[1]) or
+         parentStart != parentStart[1]
+    )
+    if newParentPeriod
+        foundFvg := false
+        savedEventId   := na
+        savedLeftTime  := na
+        savedRightTime := na
+        savedTop       := na
+        savedBottom    := na
+        savedDirection := 0
+        savedUpperViTop    := na
+        savedUpperViBottom := na
+        savedLowerViTop    := na
+        savedLowerViBottom := na
+        filterOpeningGapThisParent := false
+        openingGapTop              := na
+        openingGapBottom           := na
+    // ICT NDOG/NWOG begins at the CME 6:00 PM New York reopen.
+    // On Sunday this is the weekly reopen; on weekdays it is the daily reopen.
+    nyHour = hour(time, "America/New_York")
+    nyMinute = minute(time, "America/New_York")
+    isIctReopen = nyHour == 18 and nyMinute == 0 and not na(close[1])
+    if isIctReopen
+        candidateGapTop = math.max(open, close[1])
+        candidateGapBottom = math.min(open, close[1])
+        hasOpeningGap = candidateGapTop - candidateGapBottom >= syminfo.mintick
+        openingGapTop := hasOpeningGap ? candidateGapTop : na
+        openingGapBottom := hasOpeningGap ? candidateGapBottom : na
+        filterOpeningGapThisParent := hasOpeningGap
+    enoughBars = not na(high[2]) and not na(low[2])
+    bullishFvgSizeTicks = enoughBars ?
+         (low - high[2]) / syminfo.mintick :
+         na
+    bearishFvgSizeTicks = enoughBars ?
+         (low[2] - high) / syminfo.mintick :
+         na
+    // C2 and C3 must be in the current parent period, but C1 may precede the
+    // divider. This admits the valid 9:59 / 10:00 / 10:01 first FVG without
+    // treating a C3 printed exactly at 10:00 as a new-hour three-bar setup.
+    presentedInParent = enoughBars and
+         not na(parentStart) and
+         parentStart == parentStart[1]
+    bullishFvg = presentedInParent and
+         low > high[2] and
+         bullishFvgSizeTicks >= _minimumTicks
+    bearishFvg = presentedInParent and
+         high < low[2] and
+         bearishFvgSizeTicks >= _minimumTicks
+    if not foundFvg and (bullishFvg or bearishFvg)
+        candidateDirection = bullishFvg ? 1 : -1
+        candidateTop       = bullishFvg ? low : low[2]
+        candidateBottom    = bullishFvg ? high[2] : high
+        float candidateUpperViTop    = na
+        float candidateUpperViBottom = na
+        float candidateLowerViTop    = na
+        float candidateLowerViBottom = na
+        // C1 and C3 can have different candle directions, so use each
+        // candle's complete real-body range. A side is a VI when the two
+        // bodies do not overlap; touching at one price still qualifies.
+        // If the bodies overlap, that side keeps its wick boundary.
+        firstBodyTop       = math.max(open[2], close[2])
+        firstBodyBottom    = math.min(open[2], close[2])
+        middleBodyTop      = math.max(open[1], close[1])
+        middleBodyBottom   = math.min(open[1], close[1])
+        thirdBodyTop       = math.max(open, close)
+        thirdBodyBottom    = math.min(open, close)
+        // Candle borders can visually meet while their raw body prices
+        // overlap by one minimum tick. Treat that as contact, not a material
+        // overlap, but keep the saved boundary at the actual body price.
+        bodyContactTolerance = syminfo.mintick
+        bullishC1ToC2Vi = middleBodyBottom + bodyContactTolerance >= firstBodyTop
+        bullishC2ToC3Vi = thirdBodyBottom + bodyContactTolerance >= middleBodyTop
+        bearishC1ToC2Vi = middleBodyTop - bodyContactTolerance <= firstBodyBottom
+        bearishC2ToC3Vi = thirdBodyTop - bodyContactTolerance <= middleBodyBottom
+        //------------------------------------------------------------
+        // BULLISH FVG
+        //------------------------------------------------------------
+        if bullishFvg
+            // Candle 1 -> 2 is the lower side of a bullish FVG.
+            if bullishC1ToC2Vi
+                candidateLowerViTop    := middleBodyBottom
+                candidateLowerViBottom := firstBodyTop
+            // Candle 2 -> 3 is the upper side of a bullish FVG.
+            if bullishC2ToC3Vi
+                candidateUpperViTop    := thirdBodyBottom
+                candidateUpperViBottom := middleBodyTop
+        //------------------------------------------------------------
+        // BEARISH FVG
+        //------------------------------------------------------------
+        else
+            // Candle 1 -> 2 is the upper side of a bearish FVG.
+            if bearishC1ToC2Vi
+                candidateUpperViTop    := firstBodyBottom
+                candidateUpperViBottom := middleBodyTop
+            // Candle 2 -> 3 is the lower side of a bearish FVG.
+            if bearishC2ToC3Vi
+                candidateLowerViTop    := middleBodyBottom
+                candidateLowerViBottom := thirdBodyTop
+        // A VI replaces the wick-defined FVG boundary on its side.
+        // With VIs on both sides, both outer wicks are disregarded.
+        if not na(candidateUpperViTop)
+            candidateTop := candidateUpperViTop
+        if not na(candidateLowerViBottom)
+            candidateBottom := candidateLowerViBottom
+        // NEW: if this parent period contains an NDOG/NWOG reopen and the
+        // final FVG zone overlaps that opening gap, ignore it and keep looking.
+        overlapsOpeningGap = filterOpeningGapThisParent and
+             f_priceZonesOverlapByTick(
+                  candidateTop,
+                  candidateBottom,
+                  openingGapTop,
+                  openingGapBottom)
+        if not overlapsOpeningGap
+            foundFvg := true
+            savedEventId   := time
+            // Begin the visual zone at C1, the first candle of the FVG pattern.
+            savedLeftTime  := time[2]
+            savedRightTime := time_close(_parentTf)
+            savedTop       := candidateTop
+            savedBottom    := candidateBottom
+            savedDirection := candidateDirection
+            savedUpperViTop    := candidateUpperViTop
+            savedUpperViBottom := candidateUpperViBottom
+            savedLowerViTop    := candidateLowerViTop
+            savedLowerViBottom := candidateLowerViBottom
+    [savedEventId, savedLeftTime, savedRightTime, savedTop, savedBottom, savedDirection, savedUpperViTop, savedUpperViBottom, savedLowerViTop, savedLowerViBottom]
+//====================================================================
+// SPECIAL SESSION FIRST-PRESENTED FVG
+//====================================================================
+f_firstSessionFvg(
+     _sessionString,
+     _endHour,
+     _endMinute,
+     _sessionTimezone,
+     _minimumTicks
+) =>
+    var bool  foundFvg       = false
+    var int   savedEventId   = na
+    var int   savedLeftTime  = na
+    var int   savedRightTime = na
+    var float savedTop       = na
+    var float savedBottom    = na
+    var int   savedDirection = 0
+    var float savedUpperViTop    = na
+    var float savedUpperViBottom = na
+    var float savedLowerViTop    = na
+    var float savedLowerViBottom = na
+    sessionBarTime = time(
+         "1",
+         _sessionString,
+         _sessionTimezone
+    )
+    insideSession = not na(sessionBarTime)
+    sessionStarted = insideSession and (
+         na(sessionBarTime[1])
+    )
+    if sessionStarted
+        foundFvg := false
+        savedEventId   := na
+        savedLeftTime  := na
+        savedRightTime := na
+        savedTop       := na
+        savedBottom    := na
+        savedDirection := 0
+        savedUpperViTop    := na
+        savedUpperViBottom := na
+        savedLowerViTop    := na
+        savedLowerViBottom := na
+    enoughBars = not na(high[2]) and not na(low[2])
+    bullishFvgSizeTicks = enoughBars ?
+         (low - high[2]) / syminfo.mintick :
+         na
+    bearishFvgSizeTicks = enoughBars ?
+         (low[2] - high) / syminfo.mintick :
+         na
+    bullishFvg = insideSession and
+         enoughBars and
+         low > high[2] and
+         bullishFvgSizeTicks >= _minimumTicks
+    bearishFvg = insideSession and
+         enoughBars and
+         high < low[2] and
+         bearishFvgSizeTicks >= _minimumTicks
+    if not foundFvg and (bullishFvg or bearishFvg)
+        foundFvg := true
+        sessionYear = year(
+             time,
+             _sessionTimezone
+        )
+        sessionMonth = month(
+             time,
+             _sessionTimezone
+        )
+        sessionDay = dayofmonth(
+             time,
+             _sessionTimezone
+        )
+        fixedSessionEnd = timestamp(
+             _sessionTimezone,
+             sessionYear,
+             sessionMonth,
+             sessionDay,
+             _endHour,
+             _endMinute
+        )
+        savedEventId   := time
+        // Begin the visual zone at C1, the first candle of the FVG pattern.
+        savedLeftTime  := time[2]
+        savedRightTime := fixedSessionEnd
+        savedUpperViTop    := na
+        savedUpperViBottom := na
+        savedLowerViTop    := na
+        savedLowerViBottom := na
+        // Apply the same complete-body, no-overlap test to session FVGs.
+        // Touching bodies qualify; overlapping bodies keep the wick.
+        firstBodyTop       = math.max(open[2], close[2])
+        firstBodyBottom    = math.min(open[2], close[2])
+        middleBodyTop      = math.max(open[1], close[1])
+        middleBodyBottom   = math.min(open[1], close[1])
+        thirdBodyTop       = math.max(open, close)
+        thirdBodyBottom    = math.min(open, close)
+        bodyContactTolerance = syminfo.mintick
+        bullishC1ToC2Vi = middleBodyBottom + bodyContactTolerance >= firstBodyTop
+        bullishC2ToC3Vi = thirdBodyBottom + bodyContactTolerance >= middleBodyTop
+        bearishC1ToC2Vi = middleBodyTop - bodyContactTolerance <= firstBodyBottom
+        bearishC2ToC3Vi = thirdBodyTop - bodyContactTolerance <= middleBodyBottom
+        //------------------------------------------------------------
+        // BULLISH FVG
+        //------------------------------------------------------------
+        if bullishFvg
+            savedDirection := 1
+            savedTop       := low
+            savedBottom    := high[2]
+            // Candle 1 -> 2 is the lower side of a bullish FVG.
+            if bullishC1ToC2Vi
+                savedLowerViTop    := middleBodyBottom
+                savedLowerViBottom := firstBodyTop
+            // Candle 2 -> 3 is the upper side of a bullish FVG.
+            if bullishC2ToC3Vi
+                savedUpperViTop    := thirdBodyBottom
+                savedUpperViBottom := middleBodyTop
+        //------------------------------------------------------------
+        // BEARISH FVG
+        //------------------------------------------------------------
+        else
+            savedDirection := -1
+            savedTop       := low[2]
+            savedBottom    := high
+            // Candle 1 -> 2 is the upper side of a bearish FVG.
+            if bearishC1ToC2Vi
+                savedUpperViTop    := firstBodyBottom
+                savedUpperViBottom := middleBodyTop
+            // Candle 2 -> 3 is the lower side of a bearish FVG.
+            if bearishC2ToC3Vi
+                savedLowerViTop    := middleBodyBottom
+                savedLowerViBottom := thirdBodyTop
+        // Apply the same wick-replacement rule to special-session FVGs.
+        if not na(savedUpperViTop)
+            savedTop := savedUpperViTop
+        if not na(savedLowerViBottom)
+            savedBottom := savedLowerViBottom
+    [savedEventId, savedLeftTime, savedRightTime, savedTop, savedBottom, savedDirection, savedUpperViTop, savedUpperViBottom, savedLowerViTop, savedLowerViBottom]
+//====================================================================
+// AUTOMATIC TIMEFRAME MAPPING
+//====================================================================
+chartTfSeconds = timeframe.in_seconds()
+sessionFvgsSupported = timeframe.isintraday and chartTfSeconds <= 5 * 60
+string dividerTf = timeframe.isintraday ?
+     chartTfSeconds <= 3 * 60      ? "60" :
+     chartTfSeconds <= 15 * 60     ? "240" :
+     chartTfSeconds <= 2 * 60 * 60 ? "D" :
+     "W" :
+     "M"
+string fvgDetectionTf = timeframe.isintraday ?
+     chartTfSeconds <= 3 * 60      ? "1" :
+     chartTfSeconds <= 15 * 60     ? "5" :
+     chartTfSeconds <= 2 * 60 * 60 ? "30" :
+     "240" :
+     "D"
+string fvgParentTf = timeframe.isintraday ?
+     chartTfSeconds <= 3 * 60      ? "60" :
+     chartTfSeconds <= 15 * 60     ? "240" :
+     chartTfSeconds <= 2 * 60 * 60 ? "D" :
+     "W" :
+     "M"
+// Mapping:
+//
+// 1m-3m:
+//     Hourly dividers
+//     1-minute FVGs
+//
+// 5m-15m:
+//     4-hour dividers
+//     5-minute FVGs
+//
+// 30m-2h:
+//     Daily dividers
+//     30-minute FVGs
+//
+// Above 2h intraday:
+//     Weekly dividers
+//     4-hour FVGs
+//
+// Daily and higher:
+//     Monthly dividers
+//     Daily FVGs
+//====================================================================
+// DIVIDER SETTINGS
+//====================================================================
+dividerGroup = "Vertical Dividers"
+showDividers = input.bool(
+     true,
+     "Show vertical dividers",
+     group = dividerGroup
+)
+dividerColor = input.color(
+     color.rgb(15, 15, 15),
+     "Divider color",
+     group = dividerGroup
+)
+dividerWidth = input.int(
+     1,
+     "Divider width",
+     minval = 1,
+     maxval = 4,
+     group = dividerGroup
+)
+dividerStyleInput = input.string(
+     "Dotted",
+     "Divider style",
+     options = [
+          "Solid",
+          "Dashed",
+          "Dotted"
+     ],
+     group = dividerGroup
+)
+dividerHistory = input.int(
+     10,
+     "Previous dividers shown",
+     minval = 1,
+     maxval = 300,
+     group = dividerGroup
+)
+//====================================================================
+// FVG VISIBILITY SETTINGS
+//====================================================================
+visibilityGroup = "FVG Visibility"
+showTimeframeFvgs = input.bool(
+     true,
+     "Show timeframe-specific FVGs",
+     group = visibilityGroup
+)
+show931Fvgs = input.bool(
+     true,
+     "Show 9:31 AM FVGs",
+     group = visibilityGroup
+)
+show1331Fvgs = input.bool(
+     true,
+     "Show 1:31 PM FVGs",
+     group = visibilityGroup
+)
+timeframeFvgHistory = input.int(
+     10,
+     "Previous timeframe FVG periods",
+     minval = 1,
+     maxval = 50,
+     group = visibilityGroup
+)
+sessionFvgHistory = input.int(
+     5,
+     "Previous AM/PM FVGs shown",
+     minval = 1,
+     maxval = 30,
+     group = visibilityGroup,
+     tooltip = "Keeps this many AM FVGs and this many PM FVGs. The default 5 covers a normal Monday-Friday trading week."
+)
+sessionFvgExtensionBuffer = input.int(
+     10,
+     "AM/PM extension buffer (bars)",
+     minval = 0,
+     maxval = 500,
+     group = visibilityGroup,
+     tooltip = "Extends same-week AM/PM FVGs this many chart bars beyond the latest bar. For example, 10 equals 10 minutes on a 1-minute chart and 50 minutes on a 5-minute chart."
+)
+sessionTimezone = input.string(
+     "America/New_York",
+     "Special-session timezone",
+     options = [
+          "America/New_York",
+          "America/Chicago",
+          "Etc/UTC"
+     ],
+     group = visibilityGroup
+)
+//====================================================================
+// FVG APPEARANCE SETTINGS
+//====================================================================
+fvgGroup = "FVG Appearance"
+fvgMinimumGroup = "FVG Minimum Size (Ticks)"
+minimumFvgTicks1m = input.int(
+     25,
+     "1m FVG minimum (shown on 1m-3m charts)",
+     minval = 1,
+     maxval = 100000,
+     group = fvgMinimumGroup
+)
+minimumFvgTicks5m = input.int(
+     55,
+     "5m FVG minimum (shown on 5m-15m charts)",
+     minval = 1,
+     maxval = 100000,
+     group = fvgMinimumGroup
+)
+minimumFvgTicks30m = input.int(
+     55,
+     "30m FVG minimum (shown on 30m-2h charts)",
+     minval = 1,
+     maxval = 100000,
+     group = fvgMinimumGroup
+)
+minimumFvgTicks4h = input.int(
+     75,
+     "4h FVG minimum (shown above 2h intraday)",
+     minval = 1,
+     maxval = 100000,
+     group = fvgMinimumGroup
+)
+minimumFvgTicksDaily = input.int(
+     100,
+     "Daily FVG minimum (shown on daily+ charts)",
+     minval = 1,
+     maxval = 100000,
+     group = fvgMinimumGroup
+)
+minimumSessionFvgTicks = input.int(
+     25,
+     "AM/PM session FVG minimum",
+     minval = 1,
+     maxval = 100000,
+     group = fvgMinimumGroup
+)
+selectedFvgMinimumTicks = fvgDetectionTf == "1" ? minimumFvgTicks1m :
+     fvgDetectionTf == "5" ? minimumFvgTicks5m :
+     fvgDetectionTf == "30" ? minimumFvgTicks30m :
+     fvgDetectionTf == "240" ? minimumFvgTicks4h :
+     minimumFvgTicksDaily
+bullishFvgColor = input.color(
+     color.new(color.rgb(91, 156, 246), 84),
+     "Bullish FVG fill",
+     group = fvgGroup
+)
+bearishFvgColor = input.color(
+     color.new(color.rgb(247, 124, 128), 84),
+     "Bearish FVG fill",
+     group = fvgGroup
+)
+bullishFvgBorder = input.color(
+     color.new(color.rgb(99, 99, 99), 20),
+     "Bullish FVG border",
+     group = fvgGroup
+)
+bearishFvgBorder = input.color(
+     color.new(color.rgb(99, 99, 99), 20),
+     "Bearish FVG border",
+     group = fvgGroup
+)
+amFvgLabelColor = input.color(
+     color.rgb(99, 99, 99),
+     "AM FVG label color",
+     group = fvgGroup
+)
+pmFvgLabelColor = input.color(
+     color.rgb(99, 99, 99),
+     "PM FVG label color",
+     group = fvgGroup
+)
+fvgBorderWidth = input.int(
+     1,
+     "FVG border width",
+     minval = 0,
+     maxval = 4,
+     group = fvgGroup
+)
+//====================================================================
+// VERTICAL DIVIDERS
+//====================================================================
+const int FUTURE_DIVIDER_COUNT = 3
+const int FUTURE_DIVIDER_SEARCH_BARS = 499
+dividerPeriodStart = time(dividerTf)
+newDividerPeriod = not na(dividerPeriodStart) and (
+     na(dividerPeriodStart[1]) or
+     dividerPeriodStart != dividerPeriodStart[1]
+)
+// Historical/current divider behavior stays exactly the same.
+if showDividers and newDividerPeriod
+    f_prepareBandzLineRecord(BANDZ_LINE_OWNER_DIVIDER, 0, dividerHistory, 1)
+    line newDivider = line.new(
+         x1 = dividerPeriodStart,
+         y1 = low - syminfo.mintick,
+         x2 = dividerPeriodStart,
+         y2 = high + syminfo.mintick,
+         xloc = xloc.bar_time,
+         extend = extend.both,
+         color = dividerColor,
+         style = f_lineStyle(dividerStyleInput),
+         width = dividerWidth,
+         force_overlay = true
+    )
+    array<line> dividerRecord = array.new_line()
+    dividerRecord.push(newDivider)
+    f_storeBandzLineRecord(BANDZ_LINE_OWNER_DIVIDER, 0, dividerRecord, na)
+// Keep exactly three projected divider lines ahead of the latest chart bar.
+// These are separate from dividerHistory, so projected lines do not consume
+// any of the user's retained historical divider slots.
+var array<line> futureDividerLines = array.new_line()
+f_clearFutureDividerLines() =>
+    while futureDividerLines.size() > 0
+        line.delete(futureDividerLines.pop())
+if barstate.islast
+    f_clearFutureDividerLines()
+    if showDividers and not na(dividerPeriodStart)
+        int futureDividersFound = 0
+        int lastProjectedPeriodStart = dividerPeriodStart
+        // Pine can inspect scheduled future time-based bars with negative
+        // bars_back values. Scan forward until three distinct higher-timeframe
+        // period starts have been found.
+        for barsForward = 1 to FUTURE_DIVIDER_SEARCH_BARS
+            int projectedPeriodStart = time(dividerTf, bars_back = -barsForward)
+            if not na(projectedPeriodStart) and
+                 projectedPeriodStart > dividerPeriodStart and
+                 projectedPeriodStart != lastProjectedPeriodStart
+                line projectedDivider = line.new(
+                     x1 = projectedPeriodStart,
+                     y1 = low - syminfo.mintick,
+                     x2 = projectedPeriodStart,
+                     y2 = high + syminfo.mintick,
+                     xloc = xloc.bar_time,
+                     extend = extend.both,
+                     color = dividerColor,
+                     style = f_lineStyle(dividerStyleInput),
+                     width = dividerWidth,
+                     force_overlay = true
+                )
+                futureDividerLines.push(projectedDivider)
+                futureDividersFound += 1
+                lastProjectedPeriodStart := projectedPeriodStart
+                if futureDividersFound >= FUTURE_DIVIDER_COUNT
+                    break
+//====================================================================
+// AUTOMATIC TIMEFRAME FVG DATA
+//====================================================================
+[tfFvgEventId, tfFvgLeftTime, tfFvgRightTime, tfFvgTop, tfFvgBottom, tfFvgDirection, tfUpperViTop, tfUpperViBottom, tfLowerViTop, tfLowerViBottom] = request.security(
+     syminfo.tickerid,
+     fvgDetectionTf,
+     f_firstPresentedFvg(
+          fvgParentTf,
+          selectedFvgMinimumTicks
+     ),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+)
+var int lastTfFvgEvent = na
+var array<box> tfMainBoxes  = array.new_box()
+var array<label> tfMainLabels = array.new_label()
+newTfFvgEvent = not na(tfFvgEventId) and (
+     na(lastTfFvgEvent) or
+     tfFvgEventId != lastTfFvgEvent
+)
+if showTimeframeFvgs and
+     newTfFvgEvent and
+     not na(tfFvgLeftTime) and
+     not na(tfFvgRightTime) and
+     not na(tfFvgTop) and
+     not na(tfFvgBottom)
+    lastTfFvgEvent := tfFvgEventId
+    selectedFill = tfFvgDirection == 1 ?
+         bullishFvgColor :
+         bearishFvgColor
+    selectedBorder = tfFvgDirection == 1 ?
+         bullishFvgBorder :
+         bearishFvgBorder
+    mainBox = box.new(
+         left = tfFvgLeftTime,
+         top = tfFvgTop,
+         right = tfFvgRightTime,
+         bottom = tfFvgBottom,
+         xloc = xloc.bar_time,
+         bgcolor = selectedFill,
+         border_color = selectedBorder,
+         border_width = fvgBorderWidth,
+         force_overlay = true
+    )
+    mainLabel = label.new(
+         x = int(math.avg(tfFvgLeftTime, tfFvgRightTime)),
+         y = math.avg(tfFvgTop, tfFvgBottom),
+         text = f_detectionTfLabel(fvgDetectionTf) + " " +
+              str.format_time(tfFvgEventId, "ha", sessionTimezone),
+         xloc = xloc.bar_time,
+         yloc = yloc.price,
+         style = label.style_none,
+         textcolor = selectedBorder,
+         size = size.tiny,
+         textalign = text.align_center,
+         force_overlay = true
+    )
+    array.push(tfMainBoxes, mainBox)
+    array.push(tfMainLabels, mainLabel)
+    while array.size(tfMainBoxes) > timeframeFvgHistory
+        oldMainBox   = array.shift(tfMainBoxes)
+        oldMainLabel = array.shift(tfMainLabels)
+        if not na(oldMainBox)
+            box.delete(oldMainBox)
+        if not na(oldMainLabel)
+            label.delete(oldMainLabel)
+//====================================================================
+// OPTIONAL HIGHER-TIMEFRAME FVG DATA ON LOWER-TIMEFRAME CHARTS
+//====================================================================
+// This module only adds visibility. Each stream reuses the exact same
+// first-presented FVG detector, minimum-size setting, VI rules, and parent
+// period end time as when that timeframe is the chart's automatic FVG tier.
+bool showHtf5mFvgs = showHigherTimeframeFvgs and showTimeframeFvgs and
+     timeframe.isintraday and chartTfSeconds <= 3 * 60
+bool showHtf30mFvgs = showHigherTimeframeFvgs and showTimeframeFvgs and
+     timeframe.isintraday and chartTfSeconds <= 15 * 60
+bool showHtf4hFvgs = showHigherTimeframeFvgs and showTimeframeFvgs and
+     timeframe.isintraday and chartTfSeconds <= 2 * 60 * 60
+bool showHtfDailyFvgs = showHigherTimeframeFvgs and showTimeframeFvgs and timeframe.isintraday
+// 5-minute FVGs use the existing 5m -> 4h-parent behavior.
+[htf5FvgEventId, htf5FvgLeftTime, htf5FvgRightTime, htf5FvgTop, htf5FvgBottom, htf5FvgDirection, htf5UpperViTop, htf5UpperViBottom, htf5LowerViTop, htf5LowerViBottom] = request.security(
+     syminfo.tickerid,
+     "5",
+     f_firstPresentedFvg(
+          "240",
+          minimumFvgTicks5m
+     ),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+)
+var int lastHtf5FvgEvent = na
+var array<box> htf5MainBoxes = array.new_box()
+var array<label> htf5MainLabels = array.new_label()
+newHtf5FvgEvent = not na(htf5FvgEventId) and (
+     na(lastHtf5FvgEvent) or
+     htf5FvgEventId != lastHtf5FvgEvent
+)
+if showHtf5mFvgs and
+     newHtf5FvgEvent and
+     not na(htf5FvgLeftTime) and
+     not na(htf5FvgRightTime) and
+     not na(htf5FvgTop) and
+     not na(htf5FvgBottom)
+    lastHtf5FvgEvent := htf5FvgEventId
+    selectedFill = htf5FvgDirection == 1 ? bullishFvgColor : bearishFvgColor
+    selectedBorder = htf5FvgDirection == 1 ? bullishFvgBorder : bearishFvgBorder
+    mainBox = box.new(
+         left = htf5FvgLeftTime,
+         top = htf5FvgTop,
+         right = htf5FvgRightTime,
+         bottom = htf5FvgBottom,
+         xloc = xloc.bar_time,
+         bgcolor = selectedFill,
+         border_color = selectedBorder,
+         border_width = fvgBorderWidth,
+         force_overlay = true
+    )
+    mainLabel = label.new(
+         x = int(math.avg(htf5FvgLeftTime, htf5FvgRightTime)),
+         y = math.avg(htf5FvgTop, htf5FvgBottom),
+         text = f_detectionTfLabel("5") + " " + str.format_time(htf5FvgEventId, "ha", sessionTimezone),
+         xloc = xloc.bar_time,
+         yloc = yloc.price,
+         style = label.style_none,
+         textcolor = selectedBorder,
+         size = size.tiny,
+         textalign = text.align_center,
+         force_overlay = true
+    )
+    array.push(htf5MainBoxes, mainBox)
+    array.push(htf5MainLabels, mainLabel)
+    while array.size(htf5MainBoxes) > timeframeFvgHistory
+        oldMainBox = array.shift(htf5MainBoxes)
+        oldMainLabel = array.shift(htf5MainLabels)
+        if not na(oldMainBox)
+            box.delete(oldMainBox)
+        if not na(oldMainLabel)
+            label.delete(oldMainLabel)
+// 30-minute FVGs use the existing 30m -> Daily-parent behavior.
+[htf30FvgEventId, htf30FvgLeftTime, htf30FvgRightTime, htf30FvgTop, htf30FvgBottom, htf30FvgDirection, htf30UpperViTop, htf30UpperViBottom, htf30LowerViTop, htf30LowerViBottom] = request.security(
+     syminfo.tickerid,
+     "30",
+     f_firstPresentedFvg(
+          "D",
+          minimumFvgTicks30m
+     ),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+)
+var int lastHtf30FvgEvent = na
+var array<box> htf30MainBoxes = array.new_box()
+var array<label> htf30MainLabels = array.new_label()
+newHtf30FvgEvent = not na(htf30FvgEventId) and (
+     na(lastHtf30FvgEvent) or
+     htf30FvgEventId != lastHtf30FvgEvent
+)
+if showHtf30mFvgs and
+     newHtf30FvgEvent and
+     not na(htf30FvgLeftTime) and
+     not na(htf30FvgRightTime) and
+     not na(htf30FvgTop) and
+     not na(htf30FvgBottom)
+    lastHtf30FvgEvent := htf30FvgEventId
+    selectedFill = htf30FvgDirection == 1 ? bullishFvgColor : bearishFvgColor
+    selectedBorder = htf30FvgDirection == 1 ? bullishFvgBorder : bearishFvgBorder
+    mainBox = box.new(
+         left = htf30FvgLeftTime,
+         top = htf30FvgTop,
+         right = htf30FvgRightTime,
+         bottom = htf30FvgBottom,
+         xloc = xloc.bar_time,
+         bgcolor = selectedFill,
+         border_color = selectedBorder,
+         border_width = fvgBorderWidth,
+         force_overlay = true
+    )
+    mainLabel = label.new(
+         x = int(math.avg(htf30FvgLeftTime, htf30FvgRightTime)),
+         y = math.avg(htf30FvgTop, htf30FvgBottom),
+         text = f_detectionTfLabel("30") + " " + str.format_time(htf30FvgEventId, "ha", sessionTimezone),
+         xloc = xloc.bar_time,
+         yloc = yloc.price,
+         style = label.style_none,
+         textcolor = selectedBorder,
+         size = size.tiny,
+         textalign = text.align_center,
+         force_overlay = true
+    )
+    array.push(htf30MainBoxes, mainBox)
+    array.push(htf30MainLabels, mainLabel)
+    while array.size(htf30MainBoxes) > timeframeFvgHistory
+        oldMainBox = array.shift(htf30MainBoxes)
+        oldMainLabel = array.shift(htf30MainLabels)
+        if not na(oldMainBox)
+            box.delete(oldMainBox)
+        if not na(oldMainLabel)
+            label.delete(oldMainLabel)
+// 4-hour FVGs use the existing 4h -> Weekly-parent behavior.
+[htf4hFvgEventId, htf4hFvgLeftTime, htf4hFvgRightTime, htf4hFvgTop, htf4hFvgBottom, htf4hFvgDirection, htf4hUpperViTop, htf4hUpperViBottom, htf4hLowerViTop, htf4hLowerViBottom] = request.security(
+     syminfo.tickerid,
+     "240",
+     f_firstPresentedFvg(
+          "W",
+          minimumFvgTicks4h
+     ),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+)
+var int lastHtf4hFvgEvent = na
+var array<box> htf4hMainBoxes = array.new_box()
+var array<label> htf4hMainLabels = array.new_label()
+newHtf4hFvgEvent = not na(htf4hFvgEventId) and (
+     na(lastHtf4hFvgEvent) or
+     htf4hFvgEventId != lastHtf4hFvgEvent
+)
+if showHtf4hFvgs and
+     newHtf4hFvgEvent and
+     not na(htf4hFvgLeftTime) and
+     not na(htf4hFvgRightTime) and
+     not na(htf4hFvgTop) and
+     not na(htf4hFvgBottom)
+    lastHtf4hFvgEvent := htf4hFvgEventId
+    selectedFill = htf4hFvgDirection == 1 ? bullishFvgColor : bearishFvgColor
+    selectedBorder = htf4hFvgDirection == 1 ? bullishFvgBorder : bearishFvgBorder
+    mainBox = box.new(
+         left = htf4hFvgLeftTime,
+         top = htf4hFvgTop,
+         right = htf4hFvgRightTime,
+         bottom = htf4hFvgBottom,
+         xloc = xloc.bar_time,
+         bgcolor = selectedFill,
+         border_color = selectedBorder,
+         border_width = fvgBorderWidth,
+         force_overlay = true
+    )
+    mainLabel = label.new(
+         x = int(math.avg(htf4hFvgLeftTime, htf4hFvgRightTime)),
+         y = math.avg(htf4hFvgTop, htf4hFvgBottom),
+         text = f_detectionTfLabel("240") + " " + str.format_time(htf4hFvgEventId, "ha", sessionTimezone),
+         xloc = xloc.bar_time,
+         yloc = yloc.price,
+         style = label.style_none,
+         textcolor = selectedBorder,
+         size = size.tiny,
+         textalign = text.align_center,
+         force_overlay = true
+    )
+    array.push(htf4hMainBoxes, mainBox)
+    array.push(htf4hMainLabels, mainLabel)
+    while array.size(htf4hMainBoxes) > timeframeFvgHistory
+        oldMainBox = array.shift(htf4hMainBoxes)
+        oldMainLabel = array.shift(htf4hMainLabels)
+        if not na(oldMainBox)
+            box.delete(oldMainBox)
+        if not na(oldMainLabel)
+            label.delete(oldMainLabel)
+// Daily FVGs use the existing Daily -> Monthly-parent behavior.
+[htfDailyFvgEventId, htfDailyFvgLeftTime, htfDailyFvgRightTime, htfDailyFvgTop, htfDailyFvgBottom, htfDailyFvgDirection, htfDailyUpperViTop, htfDailyUpperViBottom, htfDailyLowerViTop, htfDailyLowerViBottom] = request.security(
+     syminfo.tickerid,
+     "D",
+     f_firstPresentedFvg(
+          "M",
+          minimumFvgTicksDaily
+     ),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+)
+var int lastHtfDailyFvgEvent = na
+var array<box> htfDailyMainBoxes = array.new_box()
+var array<label> htfDailyMainLabels = array.new_label()
+newHtfDailyFvgEvent = not na(htfDailyFvgEventId) and (
+     na(lastHtfDailyFvgEvent) or
+     htfDailyFvgEventId != lastHtfDailyFvgEvent
+)
+if showHtfDailyFvgs and
+     newHtfDailyFvgEvent and
+     not na(htfDailyFvgLeftTime) and
+     not na(htfDailyFvgRightTime) and
+     not na(htfDailyFvgTop) and
+     not na(htfDailyFvgBottom)
+    lastHtfDailyFvgEvent := htfDailyFvgEventId
+    selectedFill = htfDailyFvgDirection == 1 ? bullishFvgColor : bearishFvgColor
+    selectedBorder = htfDailyFvgDirection == 1 ? bullishFvgBorder : bearishFvgBorder
+    mainBox = box.new(
+         left = htfDailyFvgLeftTime,
+         top = htfDailyFvgTop,
+         right = htfDailyFvgRightTime,
+         bottom = htfDailyFvgBottom,
+         xloc = xloc.bar_time,
+         bgcolor = selectedFill,
+         border_color = selectedBorder,
+         border_width = fvgBorderWidth,
+         force_overlay = true
+    )
+    mainLabel = label.new(
+         x = int(math.avg(htfDailyFvgLeftTime, htfDailyFvgRightTime)),
+         y = math.avg(htfDailyFvgTop, htfDailyFvgBottom),
+         text = f_detectionTfLabel("D") + " " + str.format_time(htfDailyFvgEventId, "ha", sessionTimezone),
+         xloc = xloc.bar_time,
+         yloc = yloc.price,
+         style = label.style_none,
+         textcolor = selectedBorder,
+         size = size.tiny,
+         textalign = text.align_center,
+         force_overlay = true
+    )
+    array.push(htfDailyMainBoxes, mainBox)
+    array.push(htfDailyMainLabels, mainLabel)
+    while array.size(htfDailyMainBoxes) > timeframeFvgHistory
+        oldMainBox = array.shift(htfDailyMainBoxes)
+        oldMainLabel = array.shift(htfDailyMainLabels)
+        if not na(oldMainBox)
+            box.delete(oldMainBox)
+        if not na(oldMainLabel)
+            label.delete(oldMainLabel)
+//====================================================================
+// 9:31 AM TO 11:00 AM FVG DATA
+//====================================================================
+[amFvgEventId, amFvgLeftTime, amFvgRightTime, amFvgTop, amFvgBottom, amFvgDirection, amUpperViTop, amUpperViBottom, amLowerViTop, amLowerViBottom] = request.security(
+     syminfo.tickerid,
+     "1",
+     f_firstSessionFvg(
+          "0931-1100:23456",
+          11,
+          0,
+          sessionTimezone,
+          minimumSessionFvgTicks
+     ),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+)
+var int lastAmFvgEvent = na
+var array<box> amMainBoxes  = array.new_box()
+var array<label> amMainLabels = array.new_label()
+newAmFvgEvent = not na(amFvgEventId) and (
+     na(lastAmFvgEvent) or
+     amFvgEventId != lastAmFvgEvent
+)
+if show931Fvgs and
+     sessionFvgsSupported and
+     newAmFvgEvent and
+     not na(amFvgLeftTime) and
+     not na(amFvgRightTime) and
+     not na(amFvgTop) and
+     not na(amFvgBottom)
+    lastAmFvgEvent := amFvgEventId
+    selectedFill = amFvgDirection == 1 ?
+         bullishFvgColor :
+         bearishFvgColor
+    selectedBorder = amFvgDirection == 1 ?
+         bullishFvgBorder :
+         bearishFvgBorder
+    mainBox = box.new(
+         left = amFvgLeftTime,
+         top = amFvgTop,
+         right = amFvgRightTime,
+         bottom = amFvgBottom,
+         xloc = xloc.bar_time,
+         bgcolor = selectedFill,
+         border_color = selectedBorder,
+         border_width = fvgBorderWidth,
+         force_overlay = true
+    )
+    mainLabel = label.new(
+         x = amFvgRightTime,
+         y = math.avg(amFvgTop, amFvgBottom),
+         text = f_weekdayAbbreviation(amFvgEventId, sessionTimezone) + " AM",
+         xloc = xloc.bar_time,
+         yloc = yloc.price,
+         style = label.style_label_left,
+         color = color.new(amFvgLabelColor, 100),
+         textcolor = amFvgLabelColor,
+         size = size.tiny,
+         textalign = text.align_left,
+         force_overlay = true
+    )
+    array.push(amMainBoxes, mainBox)
+    array.push(amMainLabels, mainLabel)
+    while array.size(amMainBoxes) > sessionFvgHistory
+        oldMainBox   = array.shift(amMainBoxes)
+        oldMainLabel = array.shift(amMainLabels)
+        if not na(oldMainBox)
+            box.delete(oldMainBox)
+        if not na(oldMainLabel)
+            label.delete(oldMainLabel)
+//====================================================================
+// 1:31 PM TO 4:00 PM FVG DATA
+//====================================================================
+[pmFvgEventId, pmFvgLeftTime, pmFvgRightTime, pmFvgTop, pmFvgBottom, pmFvgDirection, pmUpperViTop, pmUpperViBottom, pmLowerViTop, pmLowerViBottom] = request.security(
+     syminfo.tickerid,
+     "1",
+     f_firstSessionFvg(
+          "1331-1600:23456",
+          16,
+          0,
+          sessionTimezone,
+          minimumSessionFvgTicks
+     ),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+)
+var int lastPmFvgEvent = na
+var array<box> pmMainBoxes  = array.new_box()
+var array<label> pmMainLabels = array.new_label()
+newPmFvgEvent = not na(pmFvgEventId) and (
+     na(lastPmFvgEvent) or
+     pmFvgEventId != lastPmFvgEvent
+)
+if show1331Fvgs and
+     sessionFvgsSupported and
+     newPmFvgEvent and
+     not na(pmFvgLeftTime) and
+     not na(pmFvgRightTime) and
+     not na(pmFvgTop) and
+     not na(pmFvgBottom)
+    lastPmFvgEvent := pmFvgEventId
+    selectedFill = pmFvgDirection == 1 ?
+         bullishFvgColor :
+         bearishFvgColor
+    selectedBorder = pmFvgDirection == 1 ?
+         bullishFvgBorder :
+         bearishFvgBorder
+    mainBox = box.new(
+         left = pmFvgLeftTime,
+         top = pmFvgTop,
+         right = pmFvgRightTime,
+         bottom = pmFvgBottom,
+         xloc = xloc.bar_time,
+         bgcolor = selectedFill,
+         border_color = selectedBorder,
+         border_width = fvgBorderWidth,
+         force_overlay = true
+    )
+    mainLabel = label.new(
+         x = pmFvgRightTime,
+         y = math.avg(pmFvgTop, pmFvgBottom),
+         text = f_weekdayAbbreviation(pmFvgEventId, sessionTimezone) + " PM",
+         xloc = xloc.bar_time,
+         yloc = yloc.price,
+         style = label.style_label_left,
+         color = color.new(pmFvgLabelColor, 100),
+         textcolor = pmFvgLabelColor,
+         size = size.tiny,
+         textalign = text.align_left,
+         force_overlay = true
+    )
+    array.push(pmMainBoxes, mainBox)
+    array.push(pmMainLabels, mainLabel)
+    while array.size(pmMainBoxes) > sessionFvgHistory
+        oldMainBox   = array.shift(pmMainBoxes)
+        oldMainLabel = array.shift(pmMainLabels)
+        if not na(oldMainBox)
+            box.delete(oldMainBox)
+        if not na(oldMainLabel)
+            label.delete(oldMainLabel)
+if extendSessionFvgsThroughWeek and sessionFvgsSupported
+    f_extendSessionFvgsThroughWeek(
+         amMainBoxes,
+         amMainLabels,
+         sessionFvgExtensionBuffer,
+         sessionTimezone
+    )
+    f_extendSessionFvgsThroughWeek(
+         pmMainBoxes,
+         pmMainLabels,
+         sessionFvgExtensionBuffer,
+         sessionTimezone
+    )
+// ============================================================================
+// BANDZ CALENDAR SEPARATORS, DAY LABELS, AND CUSTOM TIMESTAMPS
+// ============================================================================
+const int BANDZ_CALENDAR_CHANNEL_CAP = 60
+const int BANDZ_CALENDAR_LABEL_CAP = 80
+const int BANDZ_CALENDAR_DAILY_CHANNEL = 0
+const int BANDZ_CALENDAR_WEEKLY_CHANNEL = 1
+const int BANDZ_CALENDAR_MONTHLY_CHANNEL = 2
+const int BANDZ_CALENDAR_YEARLY_CHANNEL = 3
+const int BANDZ_CALENDAR_TIMESTAMP_1_CHANNEL = 4
+const int BANDZ_CALENDAR_TIMESTAMP_2_CHANNEL = 5
+const int BANDZ_CALENDAR_TIMESTAMP_3_CHANNEL = 6
+const int BANDZ_CALENDAR_TIMESTAMP_4_CHANNEL = 7
+string calendarSettingsGroup = "Calendar - Settings"
+int calendarDrawingLimit = input.int(1, "Drawing Limit", minval=1, maxval=BANDZ_CALENDAR_CHANNEL_CAP, tooltip="Number of drawings retained per enabled calendar channel when Unlimited is off.", group=calendarSettingsGroup)
+string calendarTimeframeLimit = input.timeframe("60", "Timeframe Limit", tooltip="Calendar separators, labels, and custom timestamps do not appear above this chart timeframe.", group=calendarSettingsGroup)
+string calendarTimezone = input.string("America/New_York", "Timezone", options=["America/New_York", "GMT-12", "GMT-11", "GMT-10", "GMT-9", "GMT-8", "GMT-7", "GMT-6", "GMT-5", "GMT-4", "GMT-3", "GMT-2", "GMT-1", "GMT+0", "GMT+1", "GMT+2", "GMT+3", "GMT+4", "GMT+5", "GMT+6", "GMT+7", "GMT+8", "GMT+9", "GMT+10", "GMT+11", "GMT+12", "GMT+13", "GMT+14"], tooltip="America/New_York adjusts for Daylight Saving Time. Fixed GMT selections do not.", group=calendarSettingsGroup)
+color calendarTextColor = input.color(color.rgb(120, 123, 134), "Day Label Color", group=calendarSettingsGroup)
+string calendarPeriodGroup = "Calendar - Day / Week / Month / Year"
+bool calendarSeparatorsUnlimited = input.bool(false, "Unlimited", tooltip="Uses the larger rolling safety history for each selected separator channel.", group=calendarPeriodGroup)
+bool calendarShowDaily = input.bool(false, "Daily Separators", inline="CAL_D", group=calendarPeriodGroup)
+color calendarDailyColor = input.color(color.rgb(54, 58, 69), "", inline="CAL_D", group=calendarPeriodGroup)
+bool calendarShowWeekly = input.bool(false, "Weekly Separators", inline="CAL_W", group=calendarPeriodGroup)
+color calendarWeeklyColor = input.color(color.rgb(54, 58, 69), "", inline="CAL_W", group=calendarPeriodGroup)
+bool calendarShowMonthly = input.bool(false, "Monthly Separators", inline="CAL_M", group=calendarPeriodGroup)
+color calendarMonthlyColor = input.color(color.rgb(54, 58, 69), "", inline="CAL_M", group=calendarPeriodGroup)
+bool calendarShowYearly = input.bool(false, "Yearly Separators", inline="CAL_Y", group=calendarPeriodGroup)
+color calendarYearlyColor = input.color(color.rgb(54, 58, 69), "", inline="CAL_Y", group=calendarPeriodGroup)
+string calendarSeparatorStyleInput = input.string("Solid", "Separator Style", options=["Solid", "Dotted", "Dashed"], inline="CAL_STYLE", group=calendarPeriodGroup)
+int calendarSeparatorWidth = input.int(1, "", minval=1, maxval=4, inline="CAL_STYLE", group=calendarPeriodGroup)
+bool calendarShowDayLabels = input.bool(false, "Day of Week Labels", inline="CAL_DOW", group=calendarPeriodGroup)
+string calendarDayLabelY = input.string("Bottom", "", options=["Top", "Bottom"], inline="CAL_DOW", group=calendarPeriodGroup)
+string calendarDayLabelX = input.string("Midnight", "", options=["Midnight", "Midday"], inline="CAL_DOW", group=calendarPeriodGroup)
+bool calendarHideWeekendLabels = input.bool(false, "Hide Weekend Labels", group=calendarPeriodGroup)
+string calendarTimestampGroup = "Timestamps"
+bool calendarTimestampsUnlimited = input.bool(false, "Unlimited", tooltip="Uses the larger rolling safety history for each enabled timestamp channel.", group=calendarTimestampGroup)
+bool calendarUseTimestamp1 = input.bool(false, "", inline="CAL_V1", group=calendarTimestampGroup)
+string calendarTimestamp1 = input.session("0000-0001", "", inline="CAL_V1", group=calendarTimestampGroup)
+color calendarTimestamp1Color = input.color(color.rgb(242, 54, 69), "", inline="CAL_V1", group=calendarTimestampGroup)
+bool calendarUseTimestamp2 = input.bool(false, "", inline="CAL_V2", group=calendarTimestampGroup)
+string calendarTimestamp2 = input.session("0700-0801", "", inline="CAL_V2", group=calendarTimestampGroup)
+color calendarTimestamp2Color = input.color(color.rgb(60, 70, 80), "", inline="CAL_V2", group=calendarTimestampGroup)
+bool calendarUseTimestamp3 = input.bool(false, "", inline="CAL_V3", group=calendarTimestampGroup)
+string calendarTimestamp3 = input.session("1000-1001", "", inline="CAL_V3", group=calendarTimestampGroup)
+color calendarTimestamp3Color = input.color(color.rgb(60, 70, 80), "", inline="CAL_V3", group=calendarTimestampGroup)
+bool calendarUseTimestamp4 = input.bool(false, "", inline="CAL_V4", group=calendarTimestampGroup)
+string calendarTimestamp4 = input.session("1200-1201", "", inline="CAL_V4", group=calendarTimestampGroup)
+color calendarTimestamp4Color = input.color(color.rgb(60, 70, 80), "", inline="CAL_V4", group=calendarTimestampGroup)
+string calendarTimestampStyleInput = input.string("Dotted", "Style", options=["Solid", "Dotted", "Dashed"], inline="CAL_V_STYLE", group=calendarTimestampGroup)
+int calendarTimestampWidth = input.int(1, "", minval=1, maxval=4, inline="CAL_V_STYLE", group=calendarTimestampGroup)
+var array<label> calendarDayLabelHistory = array.new_label()
+f_addBandzCalendarLine(int channel, color drawingColor, string styleInput, int drawingWidth, bool unlimited) =>
+    int keepCount = unlimited ? BANDZ_CALENDAR_CHANNEL_CAP : calendarDrawingLimit
+    f_prepareBandzLineRecord(BANDZ_LINE_OWNER_CALENDAR, channel, keepCount, 1)
+    line drawing = line.new(
+         x1=time, y1=low - syminfo.mintick,
+         x2=time, y2=high + syminfo.mintick,
+         xloc=xloc.bar_time, extend=extend.both,
+         color=drawingColor, style=f_lineStyle(styleInput), width=drawingWidth,
+         force_overlay=true)
+    array<line> recordLines = array.new_line()
+    recordLines.push(drawing)
+    f_storeBandzLineRecord(BANDZ_LINE_OWNER_CALENDAR, channel, recordLines, na)
+f_bandzCalendarDayName(int dayNumber) =>
+    switch dayNumber
+        dayofweek.sunday => "SUNDAY"
+        dayofweek.monday => "MONDAY"
+        dayofweek.tuesday => "TUESDAY"
+        dayofweek.wednesday => "WEDNESDAY"
+        dayofweek.thursday => "THURSDAY"
+        dayofweek.friday => "FRIDAY"
+        dayofweek.saturday => "SATURDAY"
+        => ""
+float calendarChartSeconds = timeframe.in_seconds(timeframe.period)
+float calendarLimitSeconds = timeframe.in_seconds(calendarTimeframeLimit)
+bool calendarWithinTimeframeLimit = timeframe.isintraday and not na(calendarChartSeconds) and
+     not na(calendarLimitSeconds) and calendarChartSeconds <= calendarLimitSeconds
+int calendarLocalYear = year(time, calendarTimezone)
+int calendarLocalMonth = month(time, calendarTimezone)
+int calendarLocalDay = dayofmonth(time, calendarTimezone)
+int calendarLocalWeekday = dayofweek(time, calendarTimezone)
+int calendarLocalMinute = hour(time, calendarTimezone) * 60 + minute(time, calendarTimezone)
+int calendarLocalDateKey = calendarLocalYear * 10000 + calendarLocalMonth * 100 + calendarLocalDay
+int calendarLocalMonthKey = calendarLocalYear * 100 + calendarLocalMonth
+int calendarDaysSinceMonday = (calendarLocalWeekday - dayofweek.monday + 7) % 7
+int calendarLocalNoon = timestamp(
+     calendarTimezone, calendarLocalYear, calendarLocalMonth, calendarLocalDay, 12, 0)
+int calendarMondayProbe = calendarLocalNoon - calendarDaysSinceMonday * 24 * 60 * 60 * 1000
+int calendarLocalWeekKey = year(calendarMondayProbe, calendarTimezone) * 10000 +
+     month(calendarMondayProbe, calendarTimezone) * 100 +
+     dayofmonth(calendarMondayProbe, calendarTimezone)
+bool calendarHasPreviousBar = bar_index > 0
+bool calendarNewDay = calendarHasPreviousBar and calendarLocalDateKey != calendarLocalDateKey[1]
+bool calendarNewWeeklyPeriod = calendarHasPreviousBar and calendarLocalWeekKey != calendarLocalWeekKey[1]
+bool calendarNewMonthlyPeriod = calendarHasPreviousBar and calendarLocalMonthKey != calendarLocalMonthKey[1]
+bool calendarNewYear = calendarHasPreviousBar and calendarLocalYear != calendarLocalYear[1]
+bool calendarTimestamp1Active = not na(time(timeframe.period, calendarTimestamp1, calendarTimezone))
+bool calendarTimestamp2Active = not na(time(timeframe.period, calendarTimestamp2, calendarTimezone))
+bool calendarTimestamp3Active = not na(time(timeframe.period, calendarTimestamp3, calendarTimezone))
+bool calendarTimestamp4Active = not na(time(timeframe.period, calendarTimestamp4, calendarTimezone))
+if calendarWithinTimeframeLimit
+    if calendarShowDaily and calendarNewDay
+        f_addBandzCalendarLine(BANDZ_CALENDAR_DAILY_CHANNEL, calendarDailyColor, calendarSeparatorStyleInput, calendarSeparatorWidth, calendarSeparatorsUnlimited)
+    if calendarShowWeekly and calendarNewWeeklyPeriod
+        f_addBandzCalendarLine(BANDZ_CALENDAR_WEEKLY_CHANNEL, calendarWeeklyColor, calendarSeparatorStyleInput, calendarSeparatorWidth, calendarSeparatorsUnlimited)
+    if calendarShowMonthly and calendarNewMonthlyPeriod
+        f_addBandzCalendarLine(BANDZ_CALENDAR_MONTHLY_CHANNEL, calendarMonthlyColor, calendarSeparatorStyleInput, calendarSeparatorWidth, calendarSeparatorsUnlimited)
+    if calendarShowYearly and calendarNewYear
+        f_addBandzCalendarLine(BANDZ_CALENDAR_YEARLY_CHANNEL, calendarYearlyColor, calendarSeparatorStyleInput, calendarSeparatorWidth, calendarSeparatorsUnlimited)
+    if calendarUseTimestamp1 and calendarTimestamp1Active and not calendarTimestamp1Active[1]
+        f_addBandzCalendarLine(BANDZ_CALENDAR_TIMESTAMP_1_CHANNEL, calendarTimestamp1Color, calendarTimestampStyleInput, calendarTimestampWidth, calendarTimestampsUnlimited)
+    if calendarUseTimestamp2 and calendarTimestamp2Active and not calendarTimestamp2Active[1]
+        f_addBandzCalendarLine(BANDZ_CALENDAR_TIMESTAMP_2_CHANNEL, calendarTimestamp2Color, calendarTimestampStyleInput, calendarTimestampWidth, calendarTimestampsUnlimited)
+    if calendarUseTimestamp3 and calendarTimestamp3Active and not calendarTimestamp3Active[1]
+        f_addBandzCalendarLine(BANDZ_CALENDAR_TIMESTAMP_3_CHANNEL, calendarTimestamp3Color, calendarTimestampStyleInput, calendarTimestampWidth, calendarTimestampsUnlimited)
+    if calendarUseTimestamp4 and calendarTimestamp4Active and not calendarTimestamp4Active[1]
+        f_addBandzCalendarLine(BANDZ_CALENDAR_TIMESTAMP_4_CHANNEL, calendarTimestamp4Color, calendarTimestampStyleInput, calendarTimestampWidth, calendarTimestampsUnlimited)
+bool calendarCrossedMidday = calendarHasPreviousBar and calendarLocalMinute >= 12 * 60 and
+     (calendarNewDay or calendarLocalMinute[1] < 12 * 60)
+bool calendarDayLabelEvent = calendarDayLabelX == "Midday" ? calendarCrossedMidday : calendarNewDay
+bool calendarWeekend = calendarLocalWeekday == dayofweek.saturday or calendarLocalWeekday == dayofweek.sunday
+if calendarWithinTimeframeLimit and calendarShowDayLabels and calendarDayLabelEvent and
+     (not calendarHideWeekendLabels or not calendarWeekend)
+    bool labelAtTop = calendarDayLabelY == "Top"
+    label dayLabel = label.new(
+         x=time, y=labelAtTop ? high : low,
+         text=f_bandzCalendarDayName(calendarLocalWeekday),
+         xloc=xloc.bar_time, yloc=labelAtTop ? yloc.abovebar : yloc.belowbar,
+         style=label.style_none, color=color.new(color.white, 100),
+         textcolor=calendarTextColor, size=size.small)
+    calendarDayLabelHistory.push(dayLabel)
+    while calendarDayLabelHistory.size() > BANDZ_CALENDAR_LABEL_CAP
+        label.delete(calendarDayLabelHistory.shift())
+//defualts1

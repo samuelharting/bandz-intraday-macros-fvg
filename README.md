@@ -1,8 +1,8 @@
-# Bandz Intraday
+# Bandz Intraday | Macros, FVGs & Time Cycles
 
 Free, open-source Pine Script v6 indicator by Bandz-ICT.
 
-Intraday timing windows, period dividers, and first-presented fair-value gaps.
+Intraday macros, multi-timeframe and first-presented FVGs, period dividers, timestamps, and day labels.
 
 ## Install in TradingView
 
